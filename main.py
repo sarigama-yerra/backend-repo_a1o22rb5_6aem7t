@@ -3,11 +3,12 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from typing import List, Optional
+import requests
 
 from schemas import Place, Guide, Event, Tour, Booking, PremiumContent
 from database import create_document, get_documents, db
 
-app = FastAPI(title="VisitPazar API", version="0.1.0")
+app = FastAPI(title="VisitPazar API", version="0.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -52,6 +53,72 @@ def test_database():
     response["database_name"] = "✅ Set" if os.getenv("DATABASE_NAME") else "❌ Not Set"
     return response
 
+# --------------------------- WIKIPEDIA INTEGRATIONS ---------------------------
+WIKI_SUMMARY_URL = "https://en.wikipedia.org/api/rest_v1/page/summary/{title}"
+WIKI_SEARCH_URL = "https://en.wikipedia.org/w/api.php"
+
+
+def fetch_wikipedia_summary(title: str) -> dict:
+    try:
+        # Try REST summary first (often includes thumbnail)
+        r = requests.get(WIKI_SUMMARY_URL.format(title=title), timeout=6)
+        if r.status_code == 200:
+            data = r.json()
+            return {
+                "title": data.get("title"),
+                "extract": data.get("extract"),
+                "thumbnail": (data.get("thumbnail") or {}).get("source"),
+                "content_urls": (data.get("content_urls") or {}).get("desktop", {}).get("page")
+            }
+        # Fallback to search
+        params = {
+            "action": "query",
+            "format": "json",
+            "prop": "pageimages|extracts",
+            "exintro": 1,
+            "explaintext": 1,
+            "piprop": "thumbnail",
+            "pithumbsize": 800,
+            "titles": title,
+        }
+        r2 = requests.get(WIKI_SEARCH_URL, params=params, timeout=6)
+        if r2.status_code == 200:
+            j = r2.json()
+            pages = j.get("query", {}).get("pages", {})
+            for _, p in pages.items():
+                return {
+                    "title": p.get("title"),
+                    "extract": p.get("extract"),
+                    "thumbnail": (p.get("thumbnail") or {}).get("source"),
+                    "content_urls": f"https://en.wikipedia.org/wiki/{p.get('title').replace(' ', '_')}" if p.get('title') else None
+                }
+        return {"title": title}
+    except Exception:
+        return {"title": title}
+
+@app.get("/api/wiki/summary")
+def wiki_summary(title: str):
+    if not title:
+        raise HTTPException(status_code=400, detail="title is required")
+    return fetch_wikipedia_summary(title)
+
+@app.get("/api/wiki/search")
+def wiki_search(query: str, limit: int = 5):
+    try:
+        params = {
+            "action": "query",
+            "list": "search",
+            "srsearch": query,
+            "srlimit": min(max(limit, 1), 10),
+            "format": "json"
+        }
+        r = requests.get(WIKI_SEARCH_URL, params=params, timeout=6)
+        r.raise_for_status()
+        data = r.json().get("query", {}).get("search", [])
+        return [{"title": i.get("title"), "snippet": i.get("snippet")} for i in data]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 # --------------------------- PLACES ---------------------------
 @app.get("/api/places", response_model=List[Place])
 def list_places(type: Optional[str] = None, recommended: Optional[bool] = None):
@@ -62,7 +129,6 @@ def list_places(type: Optional[str] = None, recommended: Optional[bool] = None):
         if recommended is not None:
             query["is_recommended"] = recommended
         docs = get_documents("place", query, limit=100)
-        # convert Mongo docs to schema without _id
         cleaned = []
         for d in docs:
             d.pop("_id", None)
@@ -74,7 +140,17 @@ def list_places(type: Optional[str] = None, recommended: Optional[bool] = None):
 @app.post("/api/places")
 def create_place(place: Place):
     try:
-        inserted_id = create_document("place", place)
+        data = place.model_dump()
+        # If no images provided, try Wikipedia thumbnail by name
+        if not data.get("images") and data.get("name"):
+            wi = fetch_wikipedia_summary(data["name"]) or {}
+            thumb = wi.get("thumbnail")
+            if thumb:
+                data["images"] = [thumb]
+            # If description missing, use extract
+            if not data.get("description") and wi.get("extract"):
+                data["description"] = wi["extract"][:800]
+        inserted_id = create_document("place", Place(**data))
         return {"id": inserted_id, "status": "ok"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
